@@ -14,7 +14,7 @@ export const getListContent = createAsyncThunk('/vehicle/list', async () => {
     var vehiclelist = [];
     var promises = []
     response.data.forEach(element => {
-	    var p = axios.get('/status/'+element.scope, {})
+	    var p = axios.get('/status', { params: { scope: element.scope } })
              .then((response) => {
                 var v = new Vehicle(element.scope)
                 v.address = element.address

@@ -11,7 +11,7 @@ export default function useRemoteDriveSession(teleopScope, activeKeys, pendingAc
     useEffect(() => {
         if (teleopScope === 'None') return;
 
-        const camWs = new WebSocket(`ws://${window.location.hostname}:8000/video`);
+        const camWs = new WebSocket(`ws://${window.location.hostname}:8000/video?scope=${teleopScope}`);
         camWs.binaryType = 'blob';
         camWs.onmessage = (e) => {
             const url = URL.createObjectURL(e.data);
@@ -22,7 +22,7 @@ export default function useRemoteDriveSession(teleopScope, activeKeys, pendingAc
         };
 
         // level throttle/brake/steer + gear; monotonic counters for discrete events (drop/dup-safe).
-        const intentWs = new WebSocket(`ws://${window.location.hostname}:8000/teleop/intent/ws`);
+        const intentWs = new WebSocket(`ws://${window.location.hostname}:8000/teleop/intent/ws?scope=${teleopScope}`);
         let gear = 'PARK';
         const counters = { mode_cycle: 0, toggle_auto: 0, reset_pose: 0 };
         const sendInterval = setInterval(() => {
@@ -48,7 +48,7 @@ export default function useRemoteDriveSession(teleopScope, activeKeys, pendingAc
             intentWs.send(JSON.stringify(intent));
         }, 50);
 
-        const teleWs = new WebSocket(`ws://${window.location.hostname}:8000/telemetry/stream`);
+        const teleWs = new WebSocket(`ws://${window.location.hostname}:8000/telemetry/stream?scope=${teleopScope}`);
         teleWs.onmessage = (e) => {
             try {
                 const data = JSON.parse(e.data);
