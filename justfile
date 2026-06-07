@@ -1,8 +1,10 @@
 # FMS dev stack — backend-aware orchestration.
 #
-#   just setup   one-time first-run setup (slow; downloads several GB)
-#   just up       bring the stack up
-#   just down     tear the stack down
+#   just setup            one-time first-run setup (slow; downloads several GB)
+#   just up fms                shared infra (sim + world + bridge + API + frontend)
+#   just up vehicle <scope>    one vehicle (ego + Autoware + teleop); scope is any name
+#   just down vehicle <scope>  tear down one vehicle
+#   just down                  tear the whole stack down
 #
 # All backend-specific logic lives in backends/${BACKEND}.sh (default carla;
 # override with BACKEND=<name>). See backends/README.md for the contract.
@@ -28,6 +30,9 @@ msg()  { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n'  "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+# A vehicle scope becomes a container name + a zenoh key + a ROS namespace;
+# this is the intersection those allow (no spaces / dots / dashes / leading digit).
+valid_scope() { [[ "$1" =~ ^[a-zA-Z][a-zA-Z0-9_]*$ ]] || die "invalid scope '$1' (use [A-Za-z][A-Za-z0-9_]*)"; }
 
 [ -f "$BACKEND_SCRIPT" ] || die "unknown BACKEND='$BACKEND'; available: $(
     ls "${PROJECT_ROOT}/backends/"*.sh 2>/dev/null \
@@ -133,10 +138,12 @@ setup:
     run_steps "${STEPS[@]}"
     msg ""
     msg "═══ Setup complete ═══"
-    msg "  Next: just up"
+    msg "  Next: just up fms, then just up vehicle v1"
 
-# Bring the full FMS dev stack up (sim + bridge + Autoware + API + frontend).
-up:
+# Bring something up:
+#   just up fms              shared infra: simulator + world + bridge + API + frontend
+#   just up vehicle <scope>  one vehicle: ego + Autoware + teleop (scope is any name)
+up target scope="":
     #!/usr/bin/env bash
     set -e
     export FMS_ROOT='{{justfile_directory()}}'
@@ -144,120 +151,136 @@ up:
     mkdir -p "${PROJECT_ROOT}/logs"
     [ -f "${PROJECT_ROOT}/.env" ] && { set -a; source "${PROJECT_ROOT}/.env"; set +a; }
 
-    cleanup_previous() {
-        backend_stop > /dev/null 2>&1 || true
-        pkill -9 -f "just run|uvicorn api_server|npm start" 2>/dev/null || true
-        fuser -k 3000/tcp 8000/tcp 2>/dev/null || true
-    }
-    # Per-deployment overrides have to land between sim and bridge startup.
-    start_simulator() {
-        backend_start_sim
-        backend_seed_custom_configs
-    }
-    start_manual_control() {
-        local mc_dir="${PROJECT_ROOT}/external/autoware_manual_control"
-        if [ ! -d "$mc_dir" ]; then
-            msg "  manual_control submodule not present; skipping (FMS UI will load but keyboard intent has no listener)"
-            return 0
-        fi
-        # Prefer the FMS-owned config (Town01 presets, vehicle, modes) over the
-        # submodule seed: $FMS_TELEOP_CONFIG -> fms_teleop_config.yaml -> seed.
-        local cfg="${FMS_TELEOP_CONFIG:-${PROJECT_ROOT}/fms_teleop_config.yaml}"
-        if [ ! -f "$cfg" ]; then
-            cfg="${mc_dir}/teleop_config.yaml"
-            local example="${cfg%.yaml}.example.yaml"
-            if [ ! -f "$cfg" ] && [ -f "$example" ]; then
-                msg "  Seeding teleop_config.yaml from .example (first run)"
-                cp "$example" "$cfg"
+    _up_fms() {
+        cleanup_previous() {
+            backend_stop > /dev/null 2>&1 || true
+            pkill -9 -f "just run|uvicorn api_server|npm start" 2>/dev/null || true
+            fuser -k 3000/tcp 8000/tcp 2>/dev/null || true
+        }
+        # Per-deployment overrides have to land between sim and bridge startup.
+        start_simulator() {
+            backend_start_sim
+            backend_seed_custom_configs
+        }
+        start_fms_services() {
+            backend_seed_frontend_assets
+
+            if [ ! -x "${PROJECT_ROOT}/frontend/node_modules/.bin/react-scripts" ]; then
+                msg "  react-scripts not installed — running npm install..."
+                (cd "${PROJECT_ROOT}/frontend" && npm install 2>&1 | tail -5)
             fi
-        fi
 
-        backend_exec_in_ros "cd '${mc_dir}' && \
-            colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release \
-                -DTELEOP_WITH_KEYBOARD=OFF -DTELEOP_WITH_ZENOH=ON" \
-            || warn "manual_control build failed (backend container may not have source mounted)"
+            # Backend-specific runtime flags (e.g. USE_BRIDGE_ROS2DDS for Carla);
+            # REACT_APP_* are sourced from env.sh inside `just run`.
+            backend_export_runtime_flags
 
-        msg "  Starting zenoh_control node..."
-        backend_exec_in_ros -d "source '${mc_dir}/install/setup.bash' && \
-            ros2 run autoware_manual_control zenoh_control --ros-args \
-                --params-file '${cfg}' \
-            > /tmp/zenoh_control.log 2>&1"
-        sleep 5  # let the C++ node register subscribers before downstream services connect
-    }
-    start_fms_services() {
-        backend_seed_frontend_assets
+            # `setsid` puts the just-tree in its own PG (logs/just.pid) so
+            # `just down` can `kill -- -PGID`. CHOKIDAR_USEPOLLING avoids inotify
+            # ENOSPC; BROWSER=none keeps `npm start` SSH-friendly.
+            BROWSER=none CHOKIDAR_USEPOLLING=true \
+                nohup setsid just run > "${PROJECT_ROOT}/logs/run.log" 2>&1 &
+            echo "$!" > "${PROJECT_ROOT}/logs/just.pid"
 
-        if [ ! -x "${PROJECT_ROOT}/frontend/node_modules/.bin/react-scripts" ]; then
-            msg "  react-scripts not installed — running npm install..."
-            (cd "${PROJECT_ROOT}/frontend" && npm install 2>&1 | tail -5)
-        fi
-
-        # Backend-specific runtime flags (e.g. USE_BRIDGE_ROS2DDS for Carla);
-        # REACT_APP_* are sourced from env.sh inside `just run`.
-        backend_export_runtime_flags
-
-        # `setsid` puts the just-tree in its own PG (logs/just.pid) so
-        # `just down` can `kill -- -PGID`. CHOKIDAR_USEPOLLING avoids inotify
-        # ENOSPC; BROWSER=none keeps `npm start` SSH-friendly.
-        BROWSER=none CHOKIDAR_USEPOLLING=true \
-            nohup setsid just run > "${PROJECT_ROOT}/logs/run.log" 2>&1 &
-        echo "$!" > "${PROJECT_ROOT}/logs/just.pid"
-
-        wait_for "API on :8000"      60 'curl -sf http://localhost:8000/'
-        wait_for "Frontend on :3000" 60 'curl -sf http://localhost:3000/'
+            wait_for "API on :8000"      60 'curl -sf http://localhost:8000/'
+            wait_for "Frontend on :3000" 60 'curl -sf http://localhost:3000/'
+        }
+        local STEPS=(
+            "Cleanup previous instances:cleanup_previous"
+            "Simulator (with per-deployment overrides):start_simulator"
+            "Load sim world (once):backend_load_world"
+            "Sim ↔ ROS bridge:backend_start_bridge"
+            "FMS API + Frontend (via just run):start_fms_services"
+        )
+        msg "═══ Starting FMS infra (backend: ${BACKEND_NAME}) ═══"
+        backend_check_runtime_prereqs
+        run_steps "${STEPS[@]}"
+        msg ""
+        msg "═══ FMS infra ready ═══"
+        msg "  Frontend: http://localhost:3000    API: http://localhost:8000"
+        msg "  Next: just up vehicle v1   (then just up vehicle v2, ... any scope)"
     }
 
-    STEPS=(
-        "Cleanup previous instances:cleanup_previous"
-        "Simulator (with per-deployment overrides):start_simulator"
-        "Sim ↔ ROS bridge:backend_start_bridge"
-        "Autoware ROS bringup:backend_start_autoware"
-        "Manual control (build + launch):start_manual_control"
-        "FMS API + Frontend (via just run):start_fms_services"
-    )
-    msg "═══ Starting FMS (backend: ${BACKEND_NAME}) ═══"
-    backend_check_runtime_prereqs
-    run_steps "${STEPS[@]}"
-    msg ""
-    msg "═══ Ready ═══"
-    msg "  Frontend:  http://localhost:3000"
-    msg "  API:       http://localhost:8000"
-    msg "  Backend:   ${BACKEND_NAME}"
-    msg ""
-    msg "  Architecture: Frontend ⇄ ws ⇄ api_server ⇄ zenoh ⇄ zenoh_control ⇄ ROS ⇄ Autoware ⇄ ${BACKEND_NAME}"
-    msg ""
-    msg "  Run just down to stop."
+    _up_vehicle() {
+        export VEHICLE="$1"
+        start_manual_control() {
+            local mc_dir="${PROJECT_ROOT}/external/autoware_manual_control"
+            if [ ! -d "$mc_dir" ]; then
+                msg "  manual_control submodule not present; skipping"
+                return 0
+            fi
+            backend_exec_in_ros "cd '${mc_dir}' && \
+                colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release \
+                    -DTELEOP_WITH_KEYBOARD=OFF -DTELEOP_WITH_ZENOH=ON" \
+                || warn "manual_control build failed (backend container may not have source mounted)"
 
-# Tear the full FMS dev stack down (FMS services + backend + port orphans).
-down:
+            # Inject the scope at runtime (-p vehicle:=...) off the one shared
+            # config, so any scope works without a per-vehicle config file.
+            msg "  Starting zenoh_control node (${VEHICLE})..."
+            backend_exec_in_ros -d "source '${mc_dir}/install/setup.bash' && \
+                ros2 run autoware_manual_control zenoh_control --ros-args \
+                --params-file '${PROJECT_ROOT}/fms_teleop_config.yaml' -p vehicle:=${VEHICLE} \
+                > /tmp/zenoh_control_${VEHICLE}.log 2>&1"
+            sleep 5  # let the C++ node register subscribers before downstream services connect
+        }
+        local STEPS=(
+            "Sim ego (${VEHICLE}):backend_start_ego"
+            "Autoware ROS bringup (${VEHICLE}):backend_start_autoware"
+            "Manual control (${VEHICLE}):start_manual_control"
+        )
+        msg "═══ Starting vehicle ${VEHICLE} (backend: ${BACKEND_NAME}) ═══"
+        backend_check_runtime_prereqs
+        run_steps "${STEPS[@]}"
+        msg ""
+        msg "  Vehicle ${VEHICLE} up — select it in a browser tab to drive."
+    }
+
+    case "{{target}}" in
+        fms)     _up_fms ;;
+        vehicle) [ -n "{{scope}}" ] || die "usage: just up vehicle <scope>"; valid_scope "{{scope}}"; _up_vehicle "{{scope}}" ;;
+        *)       die "usage: just up [fms | vehicle <scope>]" ;;
+    esac
+
+# Tear something down:
+#   just down                  everything (FMS services + backend + port orphans)
+#   just down vehicle <scope>  one vehicle (its ego + Autoware + teleop); rest stay up
+down target="" scope="":
     #!/usr/bin/env bash
     export FMS_ROOT='{{justfile_directory()}}'
     {{_lib}}
-    pidfile="${PROJECT_ROOT}/logs/just.pid"
-    msg "═══ Shutting down FMS (backend: ${BACKEND_NAME}) ═══"
 
-    # Kill the FMS service group; skip a stale PGID equal to our own (self-kill).
-    if [ -f "$pidfile" ]; then
-        pgid=$(cat "$pidfile")
-        own=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
-        if [ -n "$pgid" ] && [ "$pgid" != "$own" ] && kill -- -"$pgid" 2>/dev/null; then
-            msg "Stopped FMS service tree (PG $pgid)"
+    _down_all() {
+        pidfile="${PROJECT_ROOT}/logs/just.pid"
+        msg "═══ Shutting down FMS (backend: ${BACKEND_NAME}) ═══"
+
+        # Kill the FMS service group; skip a stale PGID equal to our own (self-kill).
+        if [ -f "$pidfile" ]; then
+            pgid=$(cat "$pidfile")
+            own=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+            if [ -n "$pgid" ] && [ "$pgid" != "$own" ] && kill -- -"$pgid" 2>/dev/null; then
+                msg "Stopped FMS service tree (PG $pgid)"
+            fi
+            rm -f "$pidfile"
         fi
-        rm -f "$pidfile"
-    fi
 
-    # Backend (sim + bridge + autoware).
-    backend_stop
+        # Backend (sim + bridge + egos + autoware).
+        backend_stop
 
-    # Defensive: orphans on FMS-owned ports.
-    for port in 3000 8000; do
-        pids=$(lsof -ti :"$port" 2>/dev/null || true)
-        if [ -n "$pids" ]; then
-            kill $pids 2>/dev/null && msg "Killed orphans on :$port (pids: $pids)"
-        fi
-    done
+        # Defensive: orphans on FMS-owned ports.
+        for port in 3000 8000; do
+            pids=$(lsof -ti :"$port" 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+                kill $pids 2>/dev/null && msg "Killed orphans on :$port (pids: $pids)"
+            fi
+        done
 
-    msg "═══ Stopped ═══"
+        msg "═══ Stopped ═══"
+    }
+
+    case "{{target}}" in
+        "")      _down_all ;;
+        vehicle) [ -n "{{scope}}" ] || die "usage: just down vehicle <scope>"; valid_scope "{{scope}}"; backend_stop_vehicle "{{scope}}" ;;
+        *)       die "usage: just down [vehicle <scope>]" ;;
+    esac
 
 # Remove Python build artifacts (does NOT stop a running stack — use `just down`).
 clean:

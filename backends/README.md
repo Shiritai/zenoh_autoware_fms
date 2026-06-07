@@ -69,12 +69,17 @@ them.
 | `backend_seed_frontend_assets` | both | mirror map etc. into `frontend/public/` |
 | `backend_seed_custom_configs` | `just up` | apply per-deploy overrides (no-op if none) |
 | `backend_export_runtime_flags` | `just up` | export backend-specific runtime env (e.g. `USE_BRIDGE_ROS2DDS`); `REACT_APP_*` come from `env.sh` via `just run` |
-| `backend_start_sim` | `just up` | start sim (no-op for real cars) |
-| `backend_start_bridge` | `just up` | start sim↔ROS bridge (no-op for real cars) |
-| `backend_start_autoware` | `just up` | start Autoware bringup |
-| `backend_wait_ready` | `just up` (optional) | wait for `is_remote_mode_available: true` |
-| `backend_exec_in_ros [-d] <cmd>` | `just up` | run `cmd` in the backend's ROS shell; `-d` = detached |
-| `backend_stop` | `just up`, `just down` | stop sim/bridge/autoware |
+| `backend_start_sim` | `just up fms` | start sim (no-op for real cars) |
+| `backend_load_world` | `just up fms` | load the sim world once (no-op for real cars) |
+| `backend_start_bridge` | `just up fms` | start sim↔ROS bridge only; egos spawned per-vehicle |
+| `backend_start_ego` | `just up vehicle` | spawn one vehicle's sim ego + sensors (no-op for real cars) |
+| `backend_start_autoware` | `just up vehicle` | start one vehicle's Autoware (own ROS domain) |
+| `backend_wait_ready` | `just up vehicle` (optional) | wait for `is_remote_mode_available: true` |
+| `backend_exec_in_ros [-d] <cmd>` | `just up vehicle` | run `cmd` in the backend's ROS shell; `-d` = detached |
+| `backend_stop` | `just up fms`, `just down` | stop sim/bridge/egos/autoware |
+| `backend_stop_vehicle <scope>` | `just down vehicle` | stop one vehicle (its ego + Autoware) |
+
+The per-vehicle hooks (`backend_start_ego`, `backend_start_autoware`, `backend_exec_in_ros`, `backend_wait_ready`) act on the vehicle named by `$VEHICLE`, exported by the recipe before they run (`run_steps` calls hooks by name, without arguments). `backend_stop_vehicle` takes the scope as `$1`.
 
 ### Helpers the justfile already provides
 
@@ -89,17 +94,24 @@ them.
 
 ## 4. Lifecycle (justfile-driven)
 
-`just up` (precondition: `backend_check_runtime_prereqs`):
+`just up fms` (precondition: `backend_check_runtime_prereqs`):
 
 ```text
 cleanup_previous       backend_stop + pkill leftovers
 start_simulator        backend_start_sim + backend_seed_custom_configs
+backend_load_world
 backend_start_bridge
-backend_start_autoware
-start_manual_control   colcon build + ros2 run zenoh_control
 start_fms_services     backend_seed_frontend_assets
                        backend_export_runtime_flags
                        just run (under setsid + nohup; PG → logs/just.pid)
+```
+
+`just up vehicle <scope>` (scope is any name; repeat per vehicle):
+
+```text
+backend_start_ego       spawn the vehicle's ego + sensors
+backend_start_autoware  one Autoware on its own ROS domain
+start_manual_control    colcon build + ros2 run zenoh_control -p vehicle:=<scope>
 ```
 
 At runtime each step is banner-printed as `[i/N]` by `run_steps`; the
@@ -107,6 +119,7 @@ counts come from the `STEPS` array, so adding or removing a step
 renumbers automatically.
 
 `just down`: stop FMS pieces → `backend_stop`.
+`just down vehicle <scope>`: `backend_stop_vehicle <scope>` (other vehicles stay up).
 
 `just setup`:
 

@@ -16,13 +16,17 @@ zenoh-bridge-ros2dds -) Autoware AD API: control commands
 
 ### Quick start
 
-Carla simulator, sim↔ROS bridge, Autoware, FMS API, and the frontend in three commands. The backend defaults to Carla; override it with `BACKEND=<name>` (see [`backends/README.md`](backends/README.md)):
+Carla simulator, sim↔ROS bridge, Autoware, FMS API, and the frontend. The backend defaults to Carla; override it with `BACKEND=<name>` (see [`backends/README.md`](backends/README.md)):
 
 ```shell
-just setup   # one-time setup (slow; downloads several GB)
-just up      # start the stack, then open http://localhost:3000
-just down    # stop the stack
+just setup              # one-time setup (slow; downloads several GB)
+just up fms             # shared infra (sim + bridge + API + frontend)
+just up vehicle v1      # add a vehicle (scope is any name); repeat for more
+just down vehicle v1    # remove one vehicle
+just down               # stop everything
 ```
+
+Then open http://localhost:3000. A scope (`v1`, `meow`, ...) names one vehicle; see [`backends/carla.md`](backends/carla.md) for the allowed characters.
 
 `just setup` is idempotent; `just clean` removes Python build artifacts (`__pycache__`, `.venv`) without stopping a running stack.
 

@@ -21,9 +21,24 @@ CARLA_LAUNCH_BRANCH="${CARLA_LAUNCH_BRANCH:-feat/fms-teleop}"
 
 BACKEND_BRIDGE_CONTAINER="zenoh_bridge"
 BACKEND_AUTOWARE_CONTAINER="zenoh_autoware"
+BACKEND_EGO_CONTAINER="zenoh_ego"
 
 _CARLA_BRIDGE_IMAGE="zenoh-carla-bridge-1.5.0"
 _AUTOWARE_RAW_IMAGE="zenoh-autoware-1.5.0"
+
+# Per-vehicle container names, keyed by an arbitrary scope (v1, v2, meow, ...).
+_autoware_container() { printf '%s_%s' "$BACKEND_AUTOWARE_CONTAINER" "$1"; }
+_ego_container()      { printf '%s_%s' "$BACKEND_EGO_CONTAINER" "$1"; }
+
+# Lowest ROS_DOMAIN_ID not already claimed by a running vehicle. Each Autoware
+# container records its domain in the fms.domain label, so domains are assigned
+# dynamically (no dependence on the scope name) and freed when a vehicle stops.
+_alloc_domain() {
+    local used n=0
+    used=$(docker ps -f label=fms.role=autoware --format '{{.Label "fms.domain"}}' 2>/dev/null)
+    while printf '%s\n' "$used" | grep -qx "$n"; do n=$((n + 1)); done
+    printf '%s' "$n"
+}
 
 # Inside-container path where rmw_zenoh's vendor prefix lives. autoware_manual_control's
 # zenohcxx find_package() looks here at build time and at runtime.
@@ -126,7 +141,7 @@ backend_start_sim() {
             sleep 1
         done
     fi
-    nohup env -u DISPLAY bash "$CARLA_BIN" -RenderOffScreen -quality-level=Low -nosound \
+    nohup env -u DISPLAY bash "$CARLA_BIN" -RenderOffScreen -nosound \
         > "${PROJECT_ROOT}/logs/carla.log" 2>&1 &
     echo -n "  Waiting for Carla on port 2000... "
     for i in $(seq 1 40); do
@@ -142,6 +157,21 @@ backend_start_sim() {
     sleep 15
 }
 
+# Load the configured Carla world once. Per-vehicle agents then
+# main.py --attach to it; if each loaded the world it would wipe the others.
+backend_load_world() {
+    [ -d "$BACKEND_ROOT" ] || return 0
+    docker run --rm --network host --privileged --ipc host \
+        -v "${BACKEND_ROOT}:/root/autoware_carla_launch" \
+        -w /root/autoware_carla_launch \
+        "$_CARLA_BRIDGE_IMAGE" \
+        bash -c 'source ./env.sh && cd external/zenoh_carla_bridge/carla_agent && \
+            ./.venv/bin/python3 set_world.py "${CARLA_SIMULATOR_IP:-127.0.0.1}"'
+}
+
+# Start the zenoh<->Carla bridge only. Egos are spawned per-vehicle by
+# backend_start_ego so each vehicle has an independent lifecycle; the bridge
+# discovers them dynamically.
 backend_start_bridge() {
     [ -d "$BACKEND_ROOT" ] || { warn "skipping bridge: backend root missing"; return 0; }
     docker rm -f "$BACKEND_BRIDGE_CONTAINER" >/dev/null 2>&1 || true
@@ -150,24 +180,54 @@ backend_start_bridge() {
         -v "${BACKEND_ROOT}:/root/autoware_carla_launch" \
         -w /root/autoware_carla_launch \
         "$_CARLA_BRIDGE_IMAGE" \
-        bash -c 'source ./env.sh && ./script/bridge_ros2dds/run-bridge.sh'
-    echo "  Waiting 15s for bridge..."
-    sleep 15
+        bash -c 'source ./env.sh && \
+            RUST_LOG=z=info "${AUTOWARE_CARLA_ROOT}/external/zenoh_carla_bridge/target/release/zenoh_carla_bridge" \
+                --mode ros2 --zenoh-listen tcp/0.0.0.0:7447 \
+                --zenoh-config ${ZENOH_CARLA_BRIDGE_CONFIG} --carla-address ${CARLA_SIMULATOR_IP}'
+    echo "  Waiting 10s for bridge..."
+    sleep 10
+}
+
+# Spawn one vehicle's ego + sensors via main.py --attach: it attaches to the
+# already-loaded world (--position random auto-picks a free spawn point) and
+# holds the actors alive. --stop-signal=SIGINT so `docker stop` triggers the
+# agent's World.destroy() for a clean teardown instead of orphaning actors.
+backend_start_ego() {
+    [ -d "$BACKEND_ROOT" ] || { warn "skipping ego: backend root missing"; return 0; }
+    local scope="${1:-${VEHICLE:?scope required}}" container
+    container="$(_ego_container "$scope")"
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    docker run -d --name "$container" --stop-signal=SIGINT \
+        --network host --privileged --ipc host --ulimit memlock=-1 \
+        --label fms.role=ego --label fms.scope="$scope" \
+        -v "${BACKEND_ROOT}:/root/autoware_carla_launch" \
+        -w /root/autoware_carla_launch \
+        "$_CARLA_BRIDGE_IMAGE" \
+        bash -c "source ./env.sh && cd external/zenoh_carla_bridge/carla_agent && \
+            ./.venv/bin/python3 main.py --attach --host \${CARLA_SIMULATOR_IP} --rolename ${scope}"
+    echo "  Waiting 8s for ego (${scope})..."
+    sleep 8
 }
 
 # Start Autoware ROS bringup container. The FMS clean_repo is mounted at
 # the same path inside the container so manual_control source paths match.
 backend_start_autoware() {
     [ -d "$BACKEND_ROOT" ] || { warn "skipping autoware: backend root missing"; return 0; }
-    docker rm -f "$BACKEND_AUTOWARE_CONTAINER" >/dev/null 2>&1 || true
-    docker run -d --name "$BACKEND_AUTOWARE_CONTAINER" \
+    local vehicle="${VEHICLE:-v1}" container domain
+    container="$(_autoware_container "$vehicle")"
+    domain="$(_alloc_domain)"
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    docker run -d --name "$container" \
         --network host --privileged --ipc host --ulimit memlock=-1 \
+        --label fms.role=autoware --label fms.scope="$vehicle" --label fms.domain="$domain" \
         -v "${PROJECT_ROOT}:${PROJECT_ROOT}" \
         -v "${BACKEND_ROOT}:/root/autoware_carla_launch" \
         -w /root/autoware_carla_launch \
         "$_AUTOWARE_RAW_IMAGE" \
-        bash -c 'source install/setup.bash && source env.sh && ./script/autoware_ros2dds/run-autoware.sh'
-    echo "  Waiting 20s for Autoware stack..."
+        bash -c "source install/setup.bash && source env.sh && \
+                 export ROS_DOMAIN_ID=${domain} && \
+                 ./script/autoware_ros2dds/run-autoware.sh ${vehicle}"
+    echo "  Waiting 20s for Autoware stack (${vehicle}, domain ${domain})..."
     sleep 20
 }
 
@@ -175,14 +235,16 @@ backend_start_autoware() {
 # or timeout. Returns 0 on ready, 1 on timeout. Optional argument: timeout
 # in seconds (default 180).
 backend_wait_ready() {
-    local timeout=${1:-180}
+    local timeout=${1:-180} container domain
+    container="$(_autoware_container "${VEHICLE:-v1}")"
+    domain="$(docker inspect -f '{{index .Config.Labels "fms.domain"}}' "$container" 2>/dev/null)"
     local start=$SECONDS
     while [ $((SECONDS - start)) -lt "$timeout" ]; do
         local out
-        out=$(docker exec "$BACKEND_AUTOWARE_CONTAINER" bash -c \
-            '. /opt/autoware/setup.bash >/dev/null 2>&1
-             export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp ROS_LOCALHOST_ONLY=1
-             timeout 2 ros2 topic echo --once /api/operation_mode/state 2>/dev/null' \
+        out=$(docker exec "$container" bash -c \
+            ". /opt/autoware/setup.bash >/dev/null 2>&1
+             export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp ROS_LOCALHOST_ONLY=1 ROS_DOMAIN_ID=${domain}
+             timeout 2 ros2 topic echo --once /api/operation_mode/state 2>/dev/null" \
             2>/dev/null || true)
         if echo "$out" | grep -q "is_remote_mode_available: true"; then
             return 0
@@ -195,34 +257,41 @@ backend_wait_ready() {
 # Run a command in the backend's Autoware ROS environment. Sources
 # /opt/autoware/setup.bash + autoware_carla_launch/env.sh + sets
 # ZENOH_VENDOR_PREFIX and LD_LIBRARY_PATH so zenohcxx is reachable for
-# both build (find_package) and run (dynamic linking).
+# both build (find_package) and run (dynamic linking). env.sh hardcodes
+# ROS_DOMAIN_ID=0, so re-pin it to this vehicle's domain (read back from the
+# container's fms.domain label) or the teleop lands in the wrong Autoware.
 #
 # Usage:  backend_exec_in_ros 'cd ... && colcon build ...'
 #         backend_exec_in_ros -d 'ros2 run ... > /tmp/log 2>&1'
 backend_exec_in_ros() {
-    local exec_opts=""
+    local exec_opts="" container domain
     if [ "$1" = "-d" ]; then
         exec_opts="-d"
         shift
     fi
-    docker exec $exec_opts "$BACKEND_AUTOWARE_CONTAINER" bash -c \
+    container="$(_autoware_container "${VEHICLE:-v1}")"
+    domain="$(docker inspect -f '{{index .Config.Labels "fms.domain"}}' "$container" 2>/dev/null)"
+    docker exec $exec_opts "$container" bash -c \
         "export ZENOH_VENDOR_PREFIX=${_ZENOH_VP_INCONTAINER} && \
          export LD_LIBRARY_PATH=\${ZENOH_VENDOR_PREFIX}/lib:\${LD_LIBRARY_PATH:-} && \
          source /opt/autoware/setup.bash && \
          source /root/autoware_carla_launch/env.sh && \
+         export ROS_DOMAIN_ID=${domain} && \
          $*"
 }
 
 # ── Shutdown ────────────────────────────────────────────────
 
 backend_stop() {
-    local stopped_any=0
-    for c in "$BACKEND_AUTOWARE_CONTAINER" "$BACKEND_BRIDGE_CONTAINER"; do
-        if docker ps -aq -f name="$c" 2>/dev/null | grep -q .; then
-            echo "[backend:carla] Stopping container: $c"
-            docker rm -f "$c" 2>/dev/null
-            stopped_any=1
-        fi
+    local stopped_any=0 c
+    # name= is a substring match, so "zenoh_autoware" also catches the
+    # per-vehicle "zenoh_autoware_v1"/"_v2"; two queries OR the two sets.
+    for c in $(docker ps -aq -f "name=$BACKEND_AUTOWARE_CONTAINER" 2>/dev/null) \
+             $(docker ps -aq -f "name=$BACKEND_EGO_CONTAINER" 2>/dev/null) \
+             $(docker ps -aq -f "name=$BACKEND_BRIDGE_CONTAINER" 2>/dev/null); do
+        echo "[backend:carla] Stopping container: $(docker inspect -f '{{.Name}}' "$c" 2>/dev/null)"
+        docker rm -f "$c" >/dev/null 2>&1
+        stopped_any=1
     done
     # force-kill: a degraded Carla (up, RPC port dead) ignores SIGTERM
     if pkill -9 -f CarlaUE4 2>/dev/null; then
@@ -233,6 +302,22 @@ backend_stop() {
     # `just down` recipe and cleaned up there.
     fuser -k 2000/tcp 7447/tcp 7887/tcp 8080/tcp 2>/dev/null || true
     return 0
+}
+
+# Stop a single vehicle (its ego + Autoware; the teleop dies with Autoware),
+# leaving other vehicles and the shared sim/bridge running. The ego is stopped
+# with `docker stop` (SIGINT, per --stop-signal) so its agent runs World.destroy
+# and cleans up the Carla actors instead of orphaning them.
+backend_stop_vehicle() {
+    local scope="${1:-${VEHICLE:-v1}}" a e
+    a="$(_autoware_container "$scope")"
+    e="$(_ego_container "$scope")"
+    docker rm -f "$a" >/dev/null 2>&1 || true
+    if docker ps -q -f "name=^${e}$" 2>/dev/null | grep -q .; then
+        docker stop "$e" >/dev/null 2>&1 || true
+    fi
+    docker rm -f "$e" >/dev/null 2>&1 || true
+    echo "[backend:carla] Stopped vehicle: $scope"
 }
 
 # ── Bootstrap (one-time first-run build) ────────────────────

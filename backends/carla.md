@@ -4,8 +4,8 @@ Wraps Carla 0.9.14 + a sibling clone of `evshary/autoware_carla_launch`.
 This is the default; running with no `BACKEND` set picks it.
 
 ```bash
-just up                 # carla (default)
-BACKEND=carla just up   # explicit
+just up fms                 # carla (default)
+BACKEND=carla just up fms   # explicit
 ```
 
 This file covers the one-time prereqs that `just setup` can't do for you.
@@ -84,21 +84,27 @@ First run on a fresh host: 30–60 min. Re-runs: under a minute (everything skip
 If you'd rather position the Carla binary yourself, drop the extracted
 tree at `${PROJECT_ROOT}/../carla-0.9.14/` (override with `CARLA_BIN` env
 var) before or after `just setup` — the binary is only consumed by
-`just up` (`backend_start_sim`).
+`just up fms` (`backend_start_sim`).
 
 ## Run
 
 ```bash
-just up
+just up fms             # shared infra
+just up vehicle v1      # one vehicle (scope is any name); repeat for more
 # http://localhost:3000
-just down
+just down vehicle v1    # remove one vehicle
+just down               # stop everything
 ```
+
+### Vehicle scope naming
+
+A scope must match `[a-zA-Z][a-zA-Z0-9_]*` — a letter, then letters / digits / underscores (e.g. `v1`, `meow`, `car_a`). No spaces, dots, dashes, leading digits, or `/ * ? #`: the name becomes a Docker container name, a Zenoh key, and a ROS namespace, and that pattern is their common subset. `just up vehicle` rejects anything else.
 
 ## Troubleshooting
 
 ### `Carla binary not found at /workspace/carla-0.9.14/CarlaUE4.sh`
 
-The Carla binary step was not done. `just up` warns and skips Carla
+The Carla binary step was not done. `just up fms` warns and skips Carla
 startup; Autoware-only flows still work, but you can't drive without Carla.
 
 ### `Docker image missing: zenoh-carla-bridge-1.5.0`
