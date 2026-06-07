@@ -26,21 +26,38 @@ app.add_middleware(
 conf = zenoh.Config.from_file('config.json5')
 session = zenoh.open(conf)
 use_bridge_ros2dds = os.environ.get('USE_BRIDGE_ROS2DDS') == 'True'
-mjpeg_server = None
 pose_service = PoseServer(session, use_bridge_ros2dds)
 
-_intent_pub = session.declare_publisher('manual_control/v1/intent')
+class Scope:
+    """Per-scope server channels: intent pub, telemetry sub + cache, camera."""
+    def __init__(self, name, session, use_bridge_ros2dds):
+        self.last_telemetry = {}
+        self.intent_pub = session.declare_publisher(f'manual_control/{name}/intent')
+        self.telemetry_sub = session.declare_subscriber(
+            f'manual_control/{name}/telemetry', self._on_telemetry)
+        self.mjpeg = MJPEG_server(session, name, use_bridge_ros2dds)
 
-_last_telemetry = {}
+    def _on_telemetry(self, sample):
+        try:
+            self.last_telemetry = json.loads(sample.payload.to_bytes().decode('utf-8'))
+        except Exception:
+            pass
 
-def _on_telemetry(sample):
-    global _last_telemetry
-    try:
-        _last_telemetry = json.loads(sample.payload.to_bytes().decode('utf-8'))
-    except Exception:
-        pass
 
-_telemetry_sub = session.declare_subscriber('manual_control/v1/telemetry', _on_telemetry)
+class ScopeRegistry:
+    """Lazily create + cache one Scope per vehicle id."""
+    def __init__(self, session, use_bridge_ros2dds):
+        self._session = session
+        self._use_bridge_ros2dds = use_bridge_ros2dds
+        self._scopes = {}
+
+    def get(self, name):
+        if name not in self._scopes:
+            self._scopes[name] = Scope(name, self._session, self._use_bridge_ros2dds)
+        return self._scopes[name]
+
+
+scopes = ScopeRegistry(session, use_bridge_ros2dds)
 
 
 @app.get('/')
@@ -63,36 +80,34 @@ async def zenoh_has_subscriber(key: str):
         pub.undeclare()
 
 
-@app.get('/status/{scope}')
-async def manage_status_autoware(scope):
+@app.get('/status')
+async def manage_status_autoware(scope: str = 'v1'):
     return {'cpu': get_cpu_status(session, scope, use_bridge_ros2dds), 'vehicle': get_vehicle_status(session, scope, use_bridge_ros2dds)}
 
 
 @app.websocket('/video')
-async def handle_ws(websocket: WebSocket):
+async def handle_ws(websocket: WebSocket, scope: str = 'v1'):
     await websocket.accept()
-    global mjpeg_server
-
+    mjpeg = scopes.get(scope).mjpeg
     try:
         while True:
-            if mjpeg_server is None or mjpeg_server.camera_image is None:
+            if mjpeg.camera_image is None:
                 await asyncio.sleep(2)
             else:
-                # Encode the frame as JPEG
-                _, buffer = cv2.imencode('.jpg', mjpeg_server.camera_image)
-                frame_bytes = buffer.tobytes()
-                await websocket.send_bytes(frame_bytes)
+                _, buffer = cv2.imencode('.jpg', mjpeg.camera_image)
+                await websocket.send_bytes(buffer.tobytes())
                 await asyncio.sleep(0.1)
     except WebSocketDisconnect:
         pass
 
 
 @app.websocket('/telemetry/stream')
-async def telemetry_stream(websocket: WebSocket):
+async def telemetry_stream(websocket: WebSocket, scope: str = 'v1'):
     await websocket.accept()
+    s = scopes.get(scope)
     try:
         while True:
-            await websocket.send_json(_last_telemetry)
+            await websocket.send_json(s.last_telemetry)
             await asyncio.sleep(0.1)  # 10Hz
     except WebSocketDisconnect:
         pass
@@ -101,11 +116,7 @@ async def telemetry_stream(websocket: WebSocket):
 @app.get('/teleop/startup')
 async def manage_teleop_startup(scope: str = 'v1'):
     """Start the camera stream; zenoh_control owns control and engage."""
-    global mjpeg_server
-    if mjpeg_server is not None:
-        mjpeg_server.change_vehicle(scope)
-    else:
-        mjpeg_server = MJPEG_server(session, scope, use_bridge_ros2dds)
+    scopes.get(scope)
     return {
         'text': f'Startup manual control on {scope}.',
         'mjpeg_host': 'localhost' if MJPEG_HOST == '0.0.0.0' else MJPEG_HOST,
@@ -114,12 +125,13 @@ async def manage_teleop_startup(scope: str = 'v1'):
 
 
 @app.websocket('/teleop/intent/ws')
-async def handle_intent_ws(websocket: WebSocket):
+async def handle_intent_ws(websocket: WebSocket, scope: str = 'v1'):
     await websocket.accept()
+    intent_pub = scopes.get(scope).intent_pub
     try:
         while True:
             data = await websocket.receive_text()
-            _intent_pub.put(data)
+            intent_pub.put(data)
     except WebSocketDisconnect:
         pass
 
